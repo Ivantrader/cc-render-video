@@ -1,6 +1,5 @@
-// server.js — API de render com CORS robusto e fallback de preview
+// server.js — API de render com CORS robusto, HTTPS correto e preview com fallback
 import express from "express";
-import cors from "cors";
 import fs from "fs";
 import path from "path";
 import os from "os";
@@ -14,28 +13,22 @@ ffmpeg.setFfmpegPath(ffmpegPath);
 // =========================== APP & CORS ===========================
 const app = express();
 app.disable("x-powered-by");
+app.set("trust proxy", true); // para ler x-forwarded-*
 app.use(express.json({ limit: "25mb" }));
 
-// CORS "duro": garante cabeçalhos até em respostas de erro e preflight
+const CORS_ORIGIN = process.env.CORS_ORIGIN || "*";
+
+// CORS “duro”: cabeçalhos SEMPRE, inclusive em erros e preflight
 app.use((req, res, next) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Origin", CORS_ORIGIN);
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With");
-  if (req.method === "OPTIONS") return res.sendStatus(204);
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    "Content-Type, Authorization, X-Requested-With, Accept"
+  );
+  if (req.method === "OPTIONS") return res.status(204).end();
   next();
 });
-
-// CORS adicional (se quiser travar por origem, defina CORS_ORIGIN no Render)
-const CORS_ORIGIN = process.env.CORS_ORIGIN || "*";
-app.use(
-  cors({
-    origin: CORS_ORIGIN,
-    methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization", "Accept"],
-    credentials: false,
-    optionsSuccessStatus: 204,
-  })
-);
 
 // Log simples
 app.use((req, _res, next) => {
@@ -46,21 +39,43 @@ app.use((req, _res, next) => {
 // =========================== STATIC ===========================
 const FILES_DIR = path.join(os.tmpdir(), "render-files");
 fs.mkdirSync(FILES_DIR, { recursive: true });
-app.use("/files", express.static(FILES_DIR));
+app.use(
+  "/files",
+  express.static(FILES_DIR, {
+    setHeaders: (res) => res.set("Cache-Control", "public, max-age=86400"),
+  })
+);
 
 const tmpFile = (ext) => tmp.fileSync({ postfix: ext }).name;
+
+// Base URL correta (evita mixed content)
+// 1) se PUBLIC_BASE_URL existir, usa ele
+// 2) senão tenta x-forwarded-proto; se vier http, força https
+const guessBaseUrl = (req) => {
+  if (process.env.PUBLIC_BASE_URL) {
+    return String(process.env.PUBLIC_BASE_URL).replace(/\/$/, "");
+  }
+  const fwd = (req.get("x-forwarded-proto") || "").split(",")[0].trim();
+  const proto = fwd || req.protocol || "https";
+  const scheme = proto === "http" ? "https" : proto;
+  const host = req.get("host");
+  return `${scheme}://${host}`;
+};
+
 const writeText = (text, ext) => {
   const p = tmpFile(ext);
   fs.writeFileSync(p, text, "utf-8");
   return p;
 };
-const guessBaseUrl = (req) => process.env.PUBLIC_BASE_URL || `${req.protocol}://${req.get("host")}`;
 
 // =========================== HEALTH & TEST ===========================
 app.get("/", (_req, res) => res.type("text").send("OK - cc-render-video"));
-app.get("/health", (_req, res) => res.json({ ok: true, time: new Date().toISOString() }));
+app.get("/health", (_req, res) =>
+  res.json({ ok: true, time: new Date().toISOString() })
+);
 app.options("/render_video", (_req, res) => res.status(204).end());
 
+// POST simples para validar CORS/POST
 app.post("/test_post", (req, res) => {
   res.json({ ok: true, cors: true, echo: req.body || null, time: new Date().toISOString() });
 });
@@ -192,7 +207,14 @@ async function concatSegments(segPaths = []) {
     ffmpeg()
       .input(listFile)
       .inputOptions(["-f concat", "-safe 0"])
-      .outputOptions(["-r 30", "-pix_fmt yuv420p", "-c:v libx264", "-preset veryfast", "-crf 23", "-movflags +faststart"])
+      .outputOptions([
+        "-r 30",
+        "-pix_fmt", "yuv420p",
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "23",
+        "-movflags", "+faststart",
+      ])
       .save(out)
       .on("stderr", (l) => console.log("[ffmpeg concat]", String(l || "").trim()))
       .on("end", resolve)
@@ -209,14 +231,14 @@ async function muxAudio(videoPath, voicePath, musicOn, duckVol = 0.35) {
     ? [
         "-filter_complex",
         `[1:a]volume=1.0[a1];[2:a]volume=${duckVol}[a2];[a1][a2]amix=inputs=2:normalize=0[aout]`,
-        "-map",
-        "0:v",
-        "-map",
-        "[aout]",
+        "-map", "0:v",
+        "-map", "[aout]",
       ]
-    : ["-map", "0:v", " -map", "1:a"];
+    : ["-map", "0:v", "-map", "1:a"]; // (corrigido: sem espaço)
   await new Promise((resolve, reject) => {
-    cmd.outputOptions(outputs).videoCodec("copy").audioCodec("aac").save(out).on("end", resolve).on("error", reject);
+    cmd.outputOptions(outputs).videoCodec("copy").audioCodec("aac").save(out)
+      .on("end", resolve)
+      .on("error", reject);
   });
   return out;
 }
@@ -265,8 +287,8 @@ app.post("/render_video", async (req, res) => {
 
     console.log("[/render_video] start", { mode, format });
 
-    // --------- PREVIEW RÁPIDO (lavfi) ---------
-    if (mode === "preview" && (body.quick !== false)) {
+    // --------- PREVIEW RÁPIDO (lavfi) ----------
+    if (mode === "preview" && body.quick !== false) {
       const out = tmpFile(".mp4");
       try {
         await new Promise((resolve, reject) => {
@@ -278,19 +300,19 @@ app.post("/render_video", async (req, res) => {
                 "text='PREVIEW 10s':fontcolor=white:fontsize=64:" +
                 "x=(w-text_w)/2:y=(h-text_h)/2:box=1:boxcolor=0x00000088"
             )
-            .outputOptions(["-pix_fmt yuv420p", "-c:v libx264", "-preset veryfast", "-crf 25", "-movflags +faststart"])
+            .outputOptions(["-pix_fmt", "yuv420p", "-c:v", "libx264", "-preset", "veryfast", "-crf", "25", "-movflags", "+faststart"])
             .save(out)
             .on("stderr", (l) => console.log("[ffmpeg preview]", String(l || "").trim()))
             .on("end", resolve)
             .on("error", reject);
         });
       } catch {
-        // fallback: sem drawtext
+        // fallback sem drawtext
         await new Promise((resolve, reject) => {
           ffmpeg()
             .input(`color=black:s=${W}x${H}:r=30:d=10`)
             .inputFormat("lavfi")
-            .outputOptions(["-pix_fmt yuv420p", "-c:v libx264", "-preset veryfast", "-crf 25", "-movflags +faststart"])
+            .outputOptions(["-pix_fmt", "yuv420p", "-c:v", "libx264", "-preset", "veryfast", "-crf", "25", "-movflags", "+faststart"])
             .save(out)
             .on("end", resolve)
             .on("error", reject);
