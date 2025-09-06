@@ -1,4 +1,4 @@
-// server.js  —  Render FFmpeg API com CORS robusto
+// server.js — API de render com CORS robusto e fallback de vídeo sólido
 import express from "express";
 import cors from "cors";
 import fs from "fs";
@@ -15,10 +15,8 @@ const app = express();
 app.disable("x-powered-by");
 app.use(express.json({ limit: "25mb" }));
 
-// ===== CORS (robusto) =====
-// Se quiser restringir, troque '*' pelo domínio do seu app Base44 (ex.: "https://channels-creator-ai....base44.app")
+// ---------- CORS ROBUSTO ----------
 const CORS_ORIGIN = process.env.CORS_ORIGIN || "*";
-
 app.use(
   cors({
     origin: CORS_ORIGIN,
@@ -28,17 +26,21 @@ app.use(
     optionsSuccessStatus: 204,
   })
 );
-
-// Garante headers também se algum middleware/rota “pular” o cors()
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", CORS_ORIGIN);
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, Accept");
-  if (req.method === "OPTIONS") return res.status(204).end(); // pré-flight OK
+  if (req.method === "OPTIONS") return res.status(204).end();
   next();
 });
 
-// ===== Arquivos públicos temporários =====
+// ---------- LOG BÁSICO ----------
+app.use((req, _res, next) => {
+  console.log(`[REQ] ${req.method} ${req.path}`);
+  next();
+});
+
+// ---------- ARQUIVOS PÚBLICOS ----------
 const FILES_DIR = path.join(os.tmpdir(), "render-files");
 fs.mkdirSync(FILES_DIR, { recursive: true });
 app.use("/files", express.static(FILES_DIR));
@@ -49,31 +51,40 @@ const writeText = (text, ext) => {
   fs.writeFileSync(p, text, "utf-8");
   return p;
 };
-
 const guessBaseUrl = (req) => process.env.PUBLIC_BASE_URL || `${req.protocol}://${req.get("host")}`;
 
-// ===== Health & raiz =====
-app.get("/", (_, res) => res.type("text").send("OK - cc-render-video"));
-app.get("/health", (_, res) => res.json({ ok: true, time: new Date().toISOString() }));
-app.options("/render_video", (_, res) => res.status(204).end()); // explícito, por redundância
+// ---------- SAÚDE ----------
+app.get("/", (_req, res) => res.type("text").send("OK - cc-render-video"));
+app.get("/health", (_req, res) => res.json({ ok: true, time: new Date().toISOString() }));
+app.options("/render_video", (_req, res) => res.status(204).end());
 
-// ===== SRT =====
+// ---------- ROTA DE TESTE (POST SIMPLES, SEM FFMPEG) ----------
+app.post("/test_post", (req, res) => {
+  res.json({
+    ok: true,
+    cors: true,
+    echo: req.body || null,
+    time: new Date().toISOString(),
+  });
+});
+
+// ---------- SRT ----------
 function buildSRT(caps = []) {
   const fmt = (t) => {
     const ms = Math.floor((t - Math.floor(t)) * 1000);
-    const h = Math.floor(t / 3600),
-      m = Math.floor((t % 3600) / 60),
-      s = Math.floor(t % 60);
+    const h = Math.floor(t / 3600);
+    const m = Math.floor((t % 3600) / 60);
+    const s = Math.floor(t % 60);
     return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")},${String(ms).padStart(3, "0")}`;
   };
-  let i = 1,
-    out = [];
+  let i = 1;
+  const out = [];
   for (const c of caps) out.push(String(i++), `${fmt(c.t0)} --> ${fmt(c.t1)}`, c.text || "", "");
   return out.join("\n");
 }
 
-// ===== TTS (silêncio) =====
-async function synthTTS(segments = [], voice = "BR-M1") {
+// ---------- TTS (silêncio) ----------
+async function synthTTS(segments = []) {
   const total = segments.reduce((a, s) => a + Math.max(0, (s.t1 || 0) - (s.t0 || 0)), 0) || 10;
   const wav = tmpFile(".wav");
   await new Promise((resolve, reject) => {
@@ -89,23 +100,43 @@ async function synthTTS(segments = [], voice = "BR-M1") {
   return wav;
 }
 
-// ===== Segmentos de vídeo =====
-async function segmentSolid({ text, width, height, duration }) {
+// ---------- VÍDEO: fallback sólido sem drawtext ----------
+async function solidNoText({ width, height, duration }) {
   const out = tmpFile(".mp4");
   const bg = `color=c=black:s=${width}x${height}:r=30:d=${duration}`;
-  const safe = (text || "").replace(/[:']/g, (m) => "\\" + m);
-  const draw = `drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:text='${safe}':fontcolor=white:fontsize=48:box=1:boxcolor=0x00000088:x=(w-text_w)/2:y=(h-text_h)/2`;
   await new Promise((resolve, reject) => {
     ffmpeg()
       .input(bg)
       .inputFormat("lavfi")
-      .videoFilters(draw)
-      .outputOptions(["-pix_fmt yuv420p"])
+      .outputOptions(["-pix_fmt", "yuv420p"])
       .save(out)
       .on("end", resolve)
       .on("error", reject);
   });
   return out;
+}
+
+async function segmentSolid({ text, width, height, duration }) {
+  const out = tmpFile(".mp4");
+  const bg = `color=c=black:s=${width}x${height}:r=30:d=${duration}`;
+  const safe = (text || "").replace(/[:']/g, (m) => "\\" + m);
+  const draw = `drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:text='${safe}':fontcolor=white:fontsize=48:box=1:boxcolor=0x00000088:x=(w-text_w)/2:y=(h-text_h)/2`;
+  try {
+    await new Promise((resolve, reject) => {
+      ffmpeg()
+        .input(bg)
+        .inputFormat("lavfi")
+        .videoFilters(draw)
+        .outputOptions(["-pix_fmt", "yuv420p"])
+        .save(out)
+        .on("end", resolve)
+        .on("error", reject);
+    });
+    return out;
+  } catch (e) {
+    console.warn("[drawtext] falhou, usando fallback sólido:", String(e));
+    return solidNoText({ width, height, duration });
+  }
 }
 
 async function segmentFromImage({ url, width, height, duration }) {
@@ -121,7 +152,7 @@ async function segmentFromImage({ url, width, height, duration }) {
       .loop(duration)
       .size(`${width}x${height}`)
       .fps(30)
-      .outputOptions(["-pix_fmt yuv420p"])
+      .outputOptions(["-pix_fmt", "yuv420p"])
       .save(out)
       .on("end", resolve)
       .on("error", reject);
@@ -138,12 +169,16 @@ async function buildVideoSegments(videoTracks = [], width, height) {
       if (v.src && v.src.startsWith("image:")) {
         seg = await segmentFromImage({ url: v.src.slice(6), width, height, duration: dur });
       } else {
-        // Limpa qualquer lixo HTML que possa ter vindo do builder (ex.: <palavra ...>)
-        const clean = (v.src || "").replace(/[<>]/g, "").replace(/data-[^=\s]+="[^"]*"/g, "");
-        seg = await segmentSolid({ text: clean.replace(/^broll:/, "") || "Cena", width, height, duration: dur });
+        // limpa HTML/lixo que vem da timeline
+        const clean = (v.src || "")
+          .replace(/[<>]/g, "")
+          .replace(/data-[^=\s]+="[^"]*"/g, "")
+          .replace(/^broll:/, "");
+        seg = await segmentSolid({ text: clean || "Cena", width, height, duration: dur });
       }
-    } catch {
-      seg = await segmentSolid({ text: "Cena", width, height, duration: dur });
+    } catch (e) {
+      console.warn("[buildVideoSegments] erro em segmento; fallback sólido:", String(e));
+      seg = await solidNoText({ width, height, duration: dur });
     }
     segs.push(seg);
   }
@@ -151,13 +186,14 @@ async function buildVideoSegments(videoTracks = [], width, height) {
 }
 
 async function concatSegments(paths = []) {
+  if (!paths.length) throw new Error("Sem segmentos de vídeo");
   const list = writeText(paths.map((p) => `file '${p}'`).join("\n"), ".txt");
   const out = tmpFile(".mp4");
   await new Promise((resolve, reject) => {
     ffmpeg()
       .input(list)
-      .inputOptions(["-f concat", "-safe 0"])
-      .outputOptions(["-c copy"])
+      .inputOptions(["-f", "concat", "-safe", "0"])
+      .outputOptions(["-c", "copy"])
       .save(out)
       .on("end", resolve)
       .on("error", reject);
@@ -180,13 +216,7 @@ async function muxAudio(videoPath, voicePath, musicOn, duckVol = 0.35) {
       ]
     : ["-map", "0:v", "-map", "1:a"];
   await new Promise((resolve, reject) => {
-    cmd
-      .outputOptions(outputs)
-      .videoCodec("copy")
-      .audioCodec("aac")
-      .save(out)
-      .on("end", resolve)
-      .on("error", reject);
+    cmd.outputOptions(outputs).videoCodec("copy").audioCodec("aac").save(out).on("end", resolve).on("error", reject);
   });
   return out;
 }
@@ -194,7 +224,7 @@ async function muxAudio(videoPath, voicePath, musicOn, duckVol = 0.35) {
 async function cut10s(inputPath) {
   const out = tmpFile(".mp4");
   await new Promise((resolve, reject) => {
-    ffmpeg(inputPath).outputOptions(["-t 10"]).save(out).on("end", resolve).on("error", reject);
+    ffmpeg(inputPath).outputOptions(["-t", "10"]).save(out).on("end", resolve).on("error", reject);
   });
   return out;
 }
@@ -222,7 +252,7 @@ async function extractThumbs(inputPath, req) {
   return urls;
 }
 
-// ===== Rota principal =====
+// ---------- RENDER ----------
 app.post("/render_video", async (req, res) => {
   try {
     const { mode = "preview", format = "9:16", timeline = {}, captions = true } = req.body || {};
@@ -230,8 +260,8 @@ app.post("/render_video", async (req, res) => {
     const W = format === "9:16" ? 1080 : 1920;
     const H = format === "9:16" ? 1920 : 1080;
 
-    const voicePath = await synthTTS(tracks.voiceover || [], (tracks.voiceover?.[0]?.voice) || "BR-M1");
-    const segs = await buildVideoSegments(tracks.video || [], W, H);
+    const voicePath = await synthTTS(tracks.voiceover || []);
+    const segs = await buildVideoSegments(tracks.video || [{ t0: 0, t1: 10, src: "broll:Preview" }], W, H);
     const videoConcat = await concatSegments(segs);
     const withAudio = await muxAudio(videoConcat, voicePath, !!(tracks.music && tracks.music.length));
 
@@ -252,10 +282,16 @@ app.post("/render_video", async (req, res) => {
 
     res.json({ final_mp4: finalUrl, srt: srtUrl, thumbs });
   } catch (err) {
-    console.error(err);
+    console.error("[/render_video] erro:", err);
+    // Ainda assim responde com CORS:
+    res.setHeader("Access-Control-Allow-Origin", CORS_ORIGIN);
     res.status(500).json({ error: "render_failed", detail: String(err?.message || err) });
   }
 });
+
+// ---------- HANDLERS GLOBAIS ----------
+process.on("unhandledRejection", (r) => console.error("[unhandledRejection]", r));
+process.on("uncaughtException", (e) => console.error("[uncaughtException]", e));
 
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log("render_video up on", PORT));
