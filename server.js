@@ -23,31 +23,23 @@ const FORCE_REAL_PREVIEW = process.env.FORCE_REAL_PREVIEW === "1";
 const PORT               = process.env.PORT || 10000;
 
 // =============== CORS ROBUSTO ===============
+// === CORS ultra-simples e robusto (sem depender de lib) ===
+const ALLOW_ORIGIN = process.env.CORS_ORIGIN || "*";
+
 app.use((req, res, next) => {
-  res.setHeader("Access-Control-Allow-Origin", CORS_ORIGIN);
+  res.setHeader("Access-Control-Allow-Origin", ALLOW_ORIGIN);
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
   res.setHeader(
     "Access-Control-Allow-Headers",
     "Content-Type, Authorization, X-Requested-With, Accept"
   );
-  if (req.method === "OPTIONS") return res.status(204).end();
+  res.setHeader("Vary", "Origin");
+  if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
 });
-app.use(
-  cors({
-    origin: CORS_ORIGIN === "*" ? true : CORS_ORIGIN,
-    methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization", "Accept"],
-    credentials: false,
-    optionsSuccessStatus: 204,
-  })
-);
 
-// Logs simples
-app.use((req, _res, next) => {
-  console.log(`[REQ] ${req.method} ${req.path}`);
-  next();
-});
+// Garante que QUALQUER preflight (qualquer rota) receba 204
+app.options("*", (_req, res) => res.sendStatus(204));
 
 // =============== STATIC (/files) ===============
 const FILES_DIR = path.join(os.tmpdir(), "render-files");
