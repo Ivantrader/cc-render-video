@@ -1,12 +1,16 @@
 {
-  "name": "render_video",
-  "version": "1.0.0",
+  "name": "cc-render-video",
+  "version": "1.0.1",
   "type": "module",
+  "scripts": {
+    "start": "node server.js"
+  },
   "dependencies": {
-    "axios": "^1.7.2",
     "express": "^4.19.2",
+    "cors": "^2.8.5",
+    "axios": "^1.7.2",
+    "tmp": "^0.2.3",
     "ffmpeg-static": "^5.2.0",
-    "fluent-ffmpeg": "^2.1.2",
-    "tmp": "^0.2.3"
+    "fluent-ffmpeg": "^2.1.2"
   }
 }
