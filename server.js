@@ -116,23 +116,46 @@ async function solidNoText({ width, height, duration }) {
   return out;
 }
 
+// ---- Gera um segmento sólido com texto (fallback)
 async function segmentSolid({ text, width, height, duration }) {
   const out = tmpFile(".mp4");
+
+  // 1) Tenta com drawtext (legível quando houver suporte de fonte)
   const bg = `color=c=black:s=${width}x${height}:r=30:d=${duration}`;
-  const safe = (text || "").replace(/[:']/g, (m) => "\\" + m);
-  const draw = `drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:text='${safe}':fontcolor=white:fontsize=48:box=1:boxcolor=0x00000088:x=(w-text_w)/2:y=(h-text_h)/2`;
+  // Caminho comum em containers Debian/Ubuntu. Se não existir, vai dar erro e cair no fallback.
+  const fontPath = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf";
+  const safe = (text || "").replace(/:/g, "\\:").replace(/'/g, "\\'");
+
+  const draw = `drawtext=fontfile=${fontPath}:text='${safe}':fontcolor=white:fontsize=48:box=1:boxcolor=0x00000088:x=(w-text_w)/2:y=(h-text_h)/2`;
+
   try {
     await new Promise((resolve, reject) => {
       ffmpeg()
         .input(bg)
         .inputFormat("lavfi")
         .videoFilters(draw)
-        .outputOptions(["-pix_fmt", "yuv420p"])
+        .outputOptions(["-pix_fmt yuv420p"])
         .save(out)
         .on("end", resolve)
         .on("error", reject);
     });
     return out;
+  } catch (e) {
+    // 2) FALLBACK: sem drawtext (apenas fundo preto), garante que sempre há vídeo
+    const out2 = tmpFile(".mp4");
+    await new Promise((resolve, reject) => {
+      ffmpeg()
+        .input(bg)
+        .inputFormat("lavfi")
+        .outputOptions(["-pix_fmt yuv420p"])
+        .save(out2)
+        .on("end", resolve)
+        .on("error", reject);
+    });
+    return out2;
+  }
+}
+
   } catch (e) {
     console.warn("[drawtext] falhou, usando fallback sólido:", String(e));
     return solidNoText({ width, height, duration });
