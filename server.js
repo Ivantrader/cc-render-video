@@ -1,4 +1,3 @@
-// server.js
 import express from "express";
 import cors from "cors";
 import fs from "fs";
@@ -9,29 +8,24 @@ import axios from "axios";
 import ffmpegPath from "ffmpeg-static";
 import ffmpeg from "fluent-ffmpeg";
 
+// FFmpeg estático
 ffmpeg.setFfmpegPath(ffmpegPath);
 
 const app = express();
-app.use(express.json({ limit: "25mb" }));
 
-// ———————————————————————————————————
-// CORS garantido em TUDO (inclui erros)
-app.use(
-  cors({
-    origin: "*",
-    methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: ["Content-Type"],
-  })
-);
+// CORS global + preflight
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Headers", "*, Content-Type");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-  if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
 });
-// ———————————————————————————————————
+app.use(cors());
+app.options("*", (req, res) => res.sendStatus(204));
 
+app.use(express.json({ limit: "25mb" }));
+
+// pasta pública para servir os arquivos gerados
 const FILES_DIR = path.join(os.tmpdir(), "render-files");
 fs.mkdirSync(FILES_DIR, { recursive: true });
 app.use("/files", express.static(FILES_DIR));
@@ -42,10 +36,11 @@ const writeText = (text, ext) => {
   fs.writeFileSync(p, text, "utf-8");
   return p;
 };
+
 const guessBaseUrl = (req) =>
   process.env.PUBLIC_BASE_URL || `${req.protocol}://${req.get("host")}`;
 
-// SRT util
+// ---------- util ----------
 function buildSRT(caps = []) {
   const fmt = (t) => {
     const ms = Math.floor((t - Math.floor(t)) * 1000);
@@ -56,20 +51,18 @@ function buildSRT(caps = []) {
       s
     ).padStart(2, "0")},${String(ms).padStart(3, "0")}`;
   };
-  let i = 1;
-  const out = [];
+  let i = 1,
+    out = [];
   for (const c of caps)
     out.push(String(i++), `${fmt(c.t0)} --> ${fmt(c.t1)}`, c.text || "", "");
   return out.join("\n");
 }
 
-// TTS fake (silêncio)
-async function synthTTS(segments = [], voice = "BR-M1") {
+// TTS “silencioso” para teste (funciona sem ElevenLabs/Polly)
+async function synthTTS(segments = []) {
   const total =
-    segments.reduce(
-      (a, s) => a + Math.max(0, (s.t1 || 0) - (s.t0 || 0)),
-      0
-    ) || 10;
+    segments.reduce((a, s) => a + Math.max(0, (s.t1 || 0) - (s.t0 || 0)), 0) ||
+    10;
   const wav = tmpFile(".wav");
   await new Promise((resolve, reject) => {
     ffmpeg()
@@ -84,19 +77,15 @@ async function synthTTS(segments = [], voice = "BR-M1") {
   return wav;
 }
 
-// Fallback sólido com texto (sem egress)
-async function segmentSolid({ text, width, height, duration }) {
+// Fallback sólido SEM drawtext (evita falha de build)
+async function segmentSolid({ width, height, duration }) {
   const out = tmpFile(".mp4");
   const bg = `color=c=black:s=${width}x${height}:r=30:d=${duration}`;
-  const safe =
-    (text || "Cena").replace(/:/g, "\\:").replace(/'/g, "\\'").slice(0, 60);
-  const draw = `drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:text='${safe}':fontcolor=white:fontsize=48:box=1:boxcolor=0x00000088:x=(w-text_w)/2:y=(h-text_h)/2`;
   await new Promise((resolve, reject) => {
     ffmpeg()
       .input(bg)
       .inputFormat("lavfi")
-      .videoFilters(draw)
-      .outputOptions(["-pix_fmt yuv420p"])
+      .outputOptions(["-pix_fmt", "yuv420p"])
       .save(out)
       .on("end", resolve)
       .on("error", reject);
@@ -104,21 +93,23 @@ async function segmentSolid({ text, width, height, duration }) {
   return out;
 }
 
-// Ken Burns leve a partir de imagem (opcional)
+// Zoompan suave em imagem (A/B)
 async function segmentFromImage({ url, width, height, duration }) {
   const img = tmpFile(path.extname(url) || ".jpg");
-  const { data } = await axios.get(url, { responseType: "arraybuffer", timeout: 15000 });
+  const { data } = await axios.get(url, { responseType: "arraybuffer" });
   fs.writeFileSync(img, data);
+
   const out = tmpFile(".mp4");
   const frames = Math.max(1, Math.round(duration * 30));
   const filter = `zoompan=z='min(zoom+0.0015,1.05)':d=${frames}:s=${width}x${height}`;
+
   await new Promise((resolve, reject) => {
     ffmpeg(img)
       .videoFilters(filter)
       .loop(duration)
       .size(`${width}x${height}`)
       .fps(30)
-      .outputOptions(["-pix_fmt yuv420p"])
+      .outputOptions(["-pix_fmt", "yuv420p"])
       .save(out)
       .on("end", resolve)
       .on("error", reject);
@@ -126,28 +117,24 @@ async function segmentFromImage({ url, width, height, duration }) {
   return out;
 }
 
-// Gera segmentos de vídeo com fallback seguro
 async function buildVideoSegments(videoTracks = [], width, height) {
   const segs = [];
   for (const v of videoTracks) {
     const dur = Math.max(0.2, (v.t1 || 0) - (v.t0 || 0) || 3);
     let seg;
     try {
-      if (v.src && /^image:/i.test(v.src)) {
-        const url = v.src.replace(/^image:/i, "");
-        seg = await segmentFromImage({ url, width, height, duration: dur });
-      } else {
-        // “broll:…” ou qualquer outro → sólido com texto
-        seg = await segmentSolid({
-          text: (v.src || "Cena").replace(/^broll:/i, ""),
+      if (v.src && v.src.startsWith("image:")) {
+        seg = await segmentFromImage({
+          url: v.src.slice(6),
           width,
           height,
           duration: dur,
         });
+      } else {
+        seg = await segmentSolid({ width, height, duration: dur });
       }
-    } catch (err) {
-      console.error("segment error:", err);
-      seg = await segmentSolid({ text: "Cena", width, height, duration: dur });
+    } catch {
+      seg = await segmentSolid({ width, height, duration: dur });
     }
     segs.push(seg);
   }
@@ -161,8 +148,8 @@ async function concatSegments(paths = []) {
   await new Promise((resolve, reject) => {
     ffmpeg()
       .input(list)
-      .inputOptions(["-f concat", "-safe 0"])
-      .outputOptions(["-c copy"])
+      .inputOptions(["-f", "concat", "-safe", "0"])
+      .outputOptions(["-c", "copy"])
       .save(out)
       .on("end", resolve)
       .on("error", reject);
@@ -170,11 +157,12 @@ async function concatSegments(paths = []) {
   return out;
 }
 
+// voice + (música opcional) -> mp4
 async function muxAudio(videoPath, voicePath, musicOn, duckVol = 0.35) {
   const out = tmpFile(".mp4");
   const cmd = ffmpeg(videoPath).input(voicePath);
-  if (musicOn)
-    cmd.input("anullsrc=r=48000:cl=stereo").inputFormat("lavfi");
+  if (musicOn) cmd.input("anullsrc=r=48000:cl=stereo").inputFormat("lavfi");
+
   const outputs = musicOn
     ? [
         "-filter_complex",
@@ -185,6 +173,7 @@ async function muxAudio(videoPath, voicePath, musicOn, duckVol = 0.35) {
         "[aout]",
       ]
     : ["-map", "0:v", "-map", "1:a"];
+
   await new Promise((resolve, reject) => {
     cmd
       .outputOptions(outputs)
@@ -201,7 +190,7 @@ async function cut10s(inputPath) {
   const out = tmpFile(".mp4");
   await new Promise((resolve, reject) => {
     ffmpeg(inputPath)
-      .outputOptions(["-t 10"])
+      .outputOptions(["-t", "10"])
       .save(out)
       .on("end", resolve)
       .on("error", reject);
@@ -215,80 +204,93 @@ async function savePublic(filePath, fileName, req) {
   return `${guessBaseUrl(req)}/files/${encodeURIComponent(fileName)}`;
 }
 
-// ——— Rotas básicas
-app.get("/", (_req, res) => res.type("text").send("OK - cc-render-video"));
-app.get("/health", (_req, res) =>
-  res.json({ ok: true, time: new Date().toISOString() })
-);
+async function extractThumbs(inputPath, req) {
+  const ts = ["00:00:02", "00:00:05", "00:00:08"];
+  const names = ["thumb_A.jpg", "thumb_B.jpg", "thumb_C.jpg"];
+  const urls = [];
+  for (let i = 0; i < 3; i++) {
+    const f = tmpFile(".jpg");
+    await new Promise((resolve, reject) => {
+      ffmpeg(inputPath)
+        .screenshots({
+          timestamps: [ts[i]],
+          filename: path.basename(f),
+          folder: path.dirname(f),
+          size: "1280x720",
+        })
+        .on("end", resolve)
+        .on("error", reject);
+    });
+    urls.push(await savePublic(f, names[i], req));
+  }
+  return urls;
+}
 
-// ——— Render principal
+// ---------- rotas ----------
+app.get("/", (req, res) => {
+  res.type("text/plain").send("OK - cc-render-video");
+});
+app.get("/health", (req, res) => {
+  res.json({ ok: true, time: new Date().toISOString() });
+});
+
 app.post("/render_video", async (req, res) => {
-  res.setHeader("Access-Control-Allow-Origin", "*"); // redundante por segurança
   try {
-    const body = req.body || {};
-    const { mode = "preview", format = "9:16", captions = true, timeline = {} } = body;
-    const { fps = 30, duration = 45, tracks = {} } = timeline;
-
+    const { mode = "preview", format = "9:16", timeline = {}, captions = true } =
+      req.body || {};
+    const { duration = 45, tracks = {} } = timeline;
     const W = format === "9:16" ? 1080 : 1920;
     const H = format === "9:16" ? 1920 : 1080;
 
-    // 1) VOZ (silêncio por enquanto)
-    const voice = await synthTTS(tracks.voiceover || [], (tracks.voiceover?.[0]?.voice) || "BR-M1");
+    // 1) voz (silenciosa por enquanto)
+    const voicePath = await synthTTS(tracks.voiceover || []);
 
-    // 2) VÍDEO (sem egress por padrão, só se vier image:)
+    // 2) vídeo
     const segs = await buildVideoSegments(tracks.video || [], W, H);
-    const videoConcat = await concatSegments(segs);
+    const concatPath = await concatSegments(segs);
 
-    // 3) ÁUDIO
-    const withAudio = await muxAudio(videoConcat, voice, !!(tracks.music && tracks.music.length));
+    // 3) mix
+    const withAudio = await muxAudio(
+      concatPath,
+      voicePath,
+      !!(tracks.music && tracks.music.length)
+    );
 
     // Preview curto
     if (mode === "preview") {
       const pv = await cut10s(withAudio);
-      const urlPrev = await savePublic(pv, `preview_10s_${format.replace(":", "x")}.mp4`, req);
+      const urlPrev = await savePublic(
+        pv,
+        `preview_10s_${format.replace(":", "x")}.mp4`,
+        req
+      );
       return res.json({ preview_mp4: urlPrev });
     }
 
-    // SRT opcional
+    // SRT
     let srtUrl = null;
     if (captions && tracks.captions?.length) {
       const srtFile = writeText(buildSRT(tracks.captions), ".srt");
       srtUrl = await savePublic(srtFile, "captions.srt", req);
     }
 
-    const urlFinal = await savePublic(
+    // Final + thumbs
+    const finalUrl = await savePublic(
       withAudio,
       `video_final_${format.replace(":", "x")}_${duration}s.mp4`,
       req
     );
-    const thumbs = await (async () => {
-      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "thumbs-"));
-      const pts = ["00:00:02", "00:00:05", "00:00:08"];
-      const names = ["thumb_A.jpg", "thumb_B.jpg", "thumb_C.jpg"];
-      const urls = [];
-      for (let i = 0; i < 3; i++) {
-        const f = path.join(dir, `t${i}.jpg`);
-        await new Promise((resolve, reject) => {
-          ffmpeg(withAudio)
-            .screenshots({ timestamps: [pts[i]], filename: path.basename(f), folder: path.dirname(f), size: "1280x720" })
-            .on("end", resolve)
-            .on("error", reject);
-        });
-        urls.push(await savePublic(f, names[i], req));
-      }
-      return urls;
-    })();
+    const thumbs = await extractThumbs(withAudio, req);
 
-    return res.json({ final_mp4: urlFinal, srt: srtUrl, thumbs });
+    res.json({ final_mp4: finalUrl, srt: srtUrl, thumbs });
   } catch (err) {
     console.error("render_failed:", err);
-    return res.status(500).json({ error: "render_failed", detail: String(err?.message || err) });
+    // **garante CORS mesmo em erro**
+    res
+      .status(500)
+      .json({ error: "render_failed", detail: String(err?.message || err) });
   }
 });
-
-// Não deixar cair por rejeições não tratadas
-process.on("unhandledRejection", (e) => console.error("UNHANDLED:", e));
-process.on("uncaughtException", (e) => console.error("UNCAUGHT:", e));
 
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log("render_video up on", PORT));
