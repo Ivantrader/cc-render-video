@@ -2,10 +2,6 @@
   "name": "cc-render-video",
   "version": "1.0.0",
   "type": "module",
-  "engines": { "node": ">=18" },
-  "scripts": {
-    "start": "node server.js"
-  },
   "dependencies": {
     "axios": "^1.7.2",
     "cors": "^2.8.5",
