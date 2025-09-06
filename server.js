@@ -15,6 +15,16 @@ const app = express();
 app.disable("x-powered-by");
 app.use(express.json({ limit: "25mb" }));
 
+// CORS "duro": garante cabeçalhos inclusive em respostas de erro
+app.use((req, res, next) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With");
+  // Para preflight
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
+});
+
 // ---------- CORS ROBUSTO ----------
 const CORS_ORIGIN = process.env.CORS_ORIGIN || "*";
 app.use(
@@ -208,19 +218,33 @@ async function buildVideoSegments(videoTracks = [], width, height) {
   return segs;
 }
 
-async function concatSegments(paths = []) {
-  if (!paths.length) throw new Error("Sem segmentos de vídeo");
-  const list = writeText(paths.map((p) => `file '${p}'`).join("\n"), ".txt");
+// ---- Concatena segmentos RECODIFICANDO (robusto)
+async function concatSegments(segPaths = []) {
+  if (!segPaths.length) throw new Error("Sem segmentos de vídeo");
+
+  // Cria lista para o demuxer concat
+  const listFile = writeText(segPaths.map(p => `file '${p}'`).join("\n"), ".txt");
   const out = tmpFile(".mp4");
+
   await new Promise((resolve, reject) => {
     ffmpeg()
-      .input(list)
-      .inputOptions(["-f", "concat", "-safe", "0"])
-      .outputOptions(["-c", "copy"])
+      .input(listFile)
+      .inputOptions(["-f concat", "-safe 0"])
+      // Reencode: mais pesado, porém muito mais estável
+      .outputOptions([
+        "-r 30",
+        "-pix_fmt yuv420p",
+        "-c:v libx264",
+        "-preset veryfast",
+        "-crf 23",
+        "-movflags +faststart",
+      ])
       .save(out)
+      .on("stderr", l => console.log("[ffmpeg concat]", String(l || "").trim()))
       .on("end", resolve)
       .on("error", reject);
   });
+
   return out;
 }
 
