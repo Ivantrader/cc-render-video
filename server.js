@@ -1,5 +1,6 @@
-// server.js — API de render com CORS robusto, HTTPS correto e preview com fallback
+// server.js — API de render com CORS robusto e preview real por padrão
 import express from "express";
+import cors from "cors";
 import fs from "fs";
 import path from "path";
 import os from "os";
@@ -13,22 +14,29 @@ ffmpeg.setFfmpegPath(ffmpegPath);
 // =========================== APP & CORS ===========================
 const app = express();
 app.disable("x-powered-by");
-app.set("trust proxy", true); // para ler x-forwarded-*
+app.set("trust proxy", true); // para req.protocol = https no Render
 app.use(express.json({ limit: "25mb" }));
 
+// CORS duro: garante cabeçalhos SEMPRE (erros e preflight inclusive)
 const CORS_ORIGIN = process.env.CORS_ORIGIN || "*";
-
-// CORS “duro”: cabeçalhos SEMPRE, inclusive em erros e preflight
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", CORS_ORIGIN);
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  res.setHeader(
-    "Access-Control-Allow-Headers",
-    "Content-Type, Authorization, X-Requested-With, Accept"
-  );
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With, Accept");
   if (req.method === "OPTIONS") return res.status(204).end();
   next();
 });
+
+// CORS adicional (não faz mal, mas pode ser removido se preferir)
+app.use(
+  cors({
+    origin: CORS_ORIGIN,
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization", "Accept"],
+    credentials: false,
+    optionsSuccessStatus: 204,
+  })
+);
 
 // Log simples
 app.use((req, _res, next) => {
@@ -39,43 +47,19 @@ app.use((req, _res, next) => {
 // =========================== STATIC ===========================
 const FILES_DIR = path.join(os.tmpdir(), "render-files");
 fs.mkdirSync(FILES_DIR, { recursive: true });
-app.use(
-  "/files",
-  express.static(FILES_DIR, {
-    setHeaders: (res) => res.set("Cache-Control", "public, max-age=86400"),
-  })
-);
+app.use("/files", express.static(FILES_DIR));
 
 const tmpFile = (ext) => tmp.fileSync({ postfix: ext }).name;
-
-// Base URL correta (evita mixed content)
-// 1) se PUBLIC_BASE_URL existir, usa ele
-// 2) senão tenta x-forwarded-proto; se vier http, força https
-const guessBaseUrl = (req) => {
-  if (process.env.PUBLIC_BASE_URL) {
-    return String(process.env.PUBLIC_BASE_URL).replace(/\/$/, "");
-  }
-  const fwd = (req.get("x-forwarded-proto") || "").split(",")[0].trim();
-  const proto = fwd || req.protocol || "https";
-  const scheme = proto === "http" ? "https" : proto;
-  const host = req.get("host");
-  return `${scheme}://${host}`;
-};
-
 const writeText = (text, ext) => {
   const p = tmpFile(ext);
   fs.writeFileSync(p, text, "utf-8");
   return p;
 };
+const guessBaseUrl = (req) => process.env.PUBLIC_BASE_URL || `${req.protocol}://${req.get("host")}`;
 
 // =========================== HEALTH & TEST ===========================
 app.get("/", (_req, res) => res.type("text").send("OK - cc-render-video"));
-app.get("/health", (_req, res) =>
-  res.json({ ok: true, time: new Date().toISOString() })
-);
-app.options("/render_video", (_req, res) => res.status(204).end());
-
-// POST simples para validar CORS/POST
+app.get("/health", (_req, res) => res.json({ ok: true, time: new Date().toISOString() }));
 app.post("/test_post", (req, res) => {
   res.json({ ok: true, cors: true, echo: req.body || null, time: new Date().toISOString() });
 });
@@ -115,13 +99,9 @@ async function solidNoText({ width, height, duration }) {
   const out = tmpFile(".mp4");
   const bg = `color=c=black:s=${width}x${height}:r=30:d=${duration}`;
   await new Promise((resolve, reject) => {
-    ffmpeg()
-      .input(bg)
-      .inputFormat("lavfi")
+    ffmpeg().input(bg).inputFormat("lavfi")
       .outputOptions(["-pix_fmt", "yuv420p"])
-      .save(out)
-      .on("end", resolve)
-      .on("error", reject);
+      .save(out).on("end", resolve).on("error", reject);
   });
   return out;
 }
@@ -131,21 +111,13 @@ async function segmentSolid({ text, width, height, duration }) {
   const bg = `color=c=black:s=${width}x${height}:r=30:d=${duration}`;
   const fontPath = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf";
   const safe = (text || "").replace(/:/g, "\\:").replace(/'/g, "\\'");
-  const draw =
-    `drawtext=fontfile=${fontPath}:` +
-    `text='${safe}':fontcolor=white:fontsize=48:box=1:boxcolor=0x00000088:` +
-    `x=(w-text_w)/2:y=(h-text_h)/2`;
+  const draw = `drawtext=fontfile=${fontPath}:text='${safe}':fontcolor=white:fontsize=48:box=1:boxcolor=0x00000088:x=(w-text_w)/2:y=(h-text_h)/2`;
 
   try {
     await new Promise((resolve, reject) => {
-      ffmpeg()
-        .input(bg)
-        .inputFormat("lavfi")
-        .videoFilters(draw)
+      ffmpeg().input(bg).inputFormat("lavfi").videoFilters(draw)
         .outputOptions(["-pix_fmt", "yuv420p"])
-        .save(out)
-        .on("end", resolve)
-        .on("error", reject);
+        .save(out).on("end", resolve).on("error", reject);
     });
     return out;
   } catch (e) {
@@ -158,9 +130,11 @@ async function segmentFromImage({ url, width, height, duration }) {
   const img = tmpFile(path.extname(url) || ".jpg");
   const { data } = await axios.get(url, { responseType: "arraybuffer" });
   fs.writeFileSync(img, data);
+
   const out = tmpFile(".mp4");
   const frames = Math.max(1, Math.round(duration * 30));
   const filter = `zoompan=z='min(zoom+0.0015,1.05)':d=${frames}:s=${width}x${height}`;
+
   await new Promise((resolve, reject) => {
     ffmpeg(img)
       .videoFilters(filter)
@@ -203,17 +177,16 @@ async function concatSegments(segPaths = []) {
   if (!segPaths.length) throw new Error("Sem segmentos de vídeo");
   const listFile = writeText(segPaths.map((p) => `file '${p}'`).join("\n"), ".txt");
   const out = tmpFile(".mp4");
+
   await new Promise((resolve, reject) => {
-    ffmpeg()
-      .input(listFile)
-      .inputOptions(["-f concat", "-safe 0"])
+    ffmpeg().input(listFile).inputOptions(["-f concat", "-safe 0"])
       .outputOptions([
         "-r 30",
-        "-pix_fmt", "yuv420p",
-        "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-crf", "23",
-        "-movflags", "+faststart",
+        "-pix_fmt yuv420p",
+        "-c:v libx264",
+        "-preset veryfast",
+        "-crf 23",
+        "-movflags +faststart",
       ])
       .save(out)
       .on("stderr", (l) => console.log("[ffmpeg concat]", String(l || "").trim()))
@@ -226,7 +199,9 @@ async function concatSegments(segPaths = []) {
 async function muxAudio(videoPath, voicePath, musicOn, duckVol = 0.35) {
   const out = tmpFile(".mp4");
   const cmd = ffmpeg(videoPath).input(voicePath);
+
   if (musicOn) cmd.input("anullsrc=r=48000:cl=stereo").inputFormat("lavfi");
+
   const outputs = musicOn
     ? [
         "-filter_complex",
@@ -234,11 +209,11 @@ async function muxAudio(videoPath, voicePath, musicOn, duckVol = 0.35) {
         "-map", "0:v",
         "-map", "[aout]",
       ]
-    : ["-map", "0:v", "-map", "1:a"]; // (corrigido: sem espaço)
+    : ["-map", "0:v", "-map", "1:a"];
+
   await new Promise((resolve, reject) => {
-    cmd.outputOptions(outputs).videoCodec("copy").audioCodec("aac").save(out)
-      .on("end", resolve)
-      .on("error", reject);
+    cmd.outputOptions(outputs).videoCodec("copy").audioCodec("aac")
+      .save(out).on("end", resolve).on("error", reject);
   });
   return out;
 }
@@ -265,7 +240,12 @@ async function extractThumbs(inputPath, req) {
     const f = tmpFile(".jpg");
     await new Promise((resolve, reject) => {
       ffmpeg(inputPath)
-        .screenshots({ timestamps: [ts[i]], filename: path.basename(f), folder: path.dirname(f), size: "1280x720" })
+        .screenshots({
+          timestamps: [ts[i]],
+          filename: path.basename(f),
+          folder: path.dirname(f),
+          size: "1280x720",
+        })
         .on("end", resolve)
         .on("error", reject);
     });
@@ -275,6 +255,9 @@ async function extractThumbs(inputPath, req) {
 }
 
 // =========================== RENDER ===========================
+const forceRealPreview =
+  /^(1|true|yes)$/i.test(process.env.FORCE_REAL_PREVIEW || "");
+
 app.post("/render_video", async (req, res) => {
   const started = Date.now();
   try {
@@ -285,10 +268,13 @@ app.post("/render_video", async (req, res) => {
     const H = format === "9:16" ? 1920 : 1080;
     const timeline = body.timeline || { tracks: {} };
 
-    console.log("[/render_video] start", { mode, format });
+    // Se for preview e NÃO estiver forçando preview real, respeita quick:true
+    const useQuick = mode === "preview" && !forceRealPreview && body.quick === true;
 
-    // --------- PREVIEW RÁPIDO (lavfi) ----------
-    if (mode === "preview" && body.quick !== false) {
+    console.log("[/render_video] start", { mode, format, useQuick, forceRealPreview });
+
+    // --------- PREVIEW RÁPIDO (tela “PREVIEW 10s”) ---------
+    if (useQuick) {
       const out = tmpFile(".mp4");
       try {
         await new Promise((resolve, reject) => {
@@ -300,19 +286,18 @@ app.post("/render_video", async (req, res) => {
                 "text='PREVIEW 10s':fontcolor=white:fontsize=64:" +
                 "x=(w-text_w)/2:y=(h-text_h)/2:box=1:boxcolor=0x00000088"
             )
-            .outputOptions(["-pix_fmt", "yuv420p", "-c:v", "libx264", "-preset", "veryfast", "-crf", "25", "-movflags", "+faststart"])
+            .outputOptions(["-pix_fmt yuv420p", "-c:v libx264", "-preset veryfast", "-crf 25", "-movflags +faststart"])
             .save(out)
             .on("stderr", (l) => console.log("[ffmpeg preview]", String(l || "").trim()))
             .on("end", resolve)
             .on("error", reject);
         });
       } catch {
-        // fallback sem drawtext
         await new Promise((resolve, reject) => {
           ffmpeg()
             .input(`color=black:s=${W}x${H}:r=30:d=10`)
             .inputFormat("lavfi")
-            .outputOptions(["-pix_fmt", "yuv420p", "-c:v", "libx264", "-preset", "veryfast", "-crf", "25", "-movflags", "+faststart"])
+            .outputOptions(["-pix_fmt yuv420p", "-c:v libx264", "-preset veryfast", "-crf 25", "-movflags +faststart"])
             .save(out)
             .on("end", resolve)
             .on("error", reject);
@@ -326,8 +311,7 @@ app.post("/render_video", async (req, res) => {
     const voicePath = await synthTTS(timeline.tracks?.voiceover || []);
     const segs = await buildVideoSegments(
       timeline.tracks?.video || [{ t0: 0, t1: 10, src: "broll:Preview" }],
-      W,
-      H
+      W, H
     );
     const videoConcat = await concatSegments(segs);
     const withAudio = await muxAudio(
